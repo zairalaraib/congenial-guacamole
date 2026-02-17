@@ -1,1 +1,784 @@
+# pip install opencv-python mediapipe numpy
+"""
+Real-time AR Hand Gesture Effects System
+Inspired by wxll.hx — dense particle fields, heavy bloom, data-viz labels.
+Run: python ar_gestures.py
+Press 'Q' to exit.
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+import time
+import random
+import string
+from collections import deque
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+def make_particle(x, y, vx=0.0, vy=0.0, color=(255, 255, 255), size=2,
+                  max_age=60, fade=True, gravity=0.0):
+    return {
+        "x": float(x), "y": float(y),
+        "vx": float(vx), "vy": float(vy),
+        "color": color, "size": size,
+        "age": 0, "max_age": max_age, "fade": fade,
+        "gravity": gravity,
+    }
+
+
+def make_label(x, y, text=None, vx=0.0, vy=0.0, max_age=120,
+               color=(255, 255, 255)):
+    if text is None:
+        # Format like reference: "J50116" style with leading icon marker
+        text = "J" + "".join(random.choices(string.digits, k=random.choice([4, 5])))
+    return {
+        "x": float(x), "y": float(y),
+        "vx": float(vx), "vy": float(vy),
+        "text": text, "age": 0, "max_age": max_age,
+        "color": color,
+        "marker_radius": random.choice([3, 4, 5]),
+    }
+
+
+def make_bolt(cx, cy, ex, ey, segments=8, max_age=20, thickness=2):
+    points = []
+    for i in range(segments + 1):
+        t = i / segments
+        px = cx + (ex - cx) * t
+        py = cy + (ey - cy) * t
+        if 0 < i < segments:
+            perp_x = -(ey - cy)
+            perp_y = (ex - cx)
+            length = math.sqrt(perp_x ** 2 + perp_y ** 2) + 1e-6
+            perp_x /= length
+            perp_y /= length
+            jitter = random.uniform(-50, 50)
+            px += perp_x * jitter
+            py += perp_y * jitter
+        points.append((int(px), int(py)))
+    return {
+        "points": points, "age": 0, "max_age": max_age,
+        "thickness": thickness,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
+
+def multi_layer_glow(overlay, kernels=None, alphas=None):
+    """Build a multi-pass bloom from an overlay drawn on black."""
+    if kernels is None:
+        kernels = [(15, 15), (31, 31), (63, 63), (95, 95)]
+    if alphas is None:
+        alphas = [1.0, 0.7, 0.4, 0.2]
+    result = overlay.copy()
+    for k, a in zip(kernels, alphas):
+        blurred = cv2.GaussianBlur(overlay, k, 0)
+        result = cv2.addWeighted(result, 1.0, blurred, a, 0)
+    return result
+
+
+def draw_radial_gradient_sphere(overlay, cx, cy, radius, inner_color, outer_color):
+    """Draw a sphere using radial gradient via NumPy masking — fast."""
+    y_coords, x_coords = np.ogrid[
+        max(0, cy - radius):min(overlay.shape[0], cy + radius),
+        max(0, cx - radius):min(overlay.shape[1], cx + radius)
+    ]
+    dist = np.sqrt((x_coords - cx) ** 2 + (y_coords - cy) ** 2).astype(np.float32)
+    mask = dist <= radius
+    t = np.clip(dist / max(radius, 1), 0, 1)
+
+    region = overlay[
+        max(0, cy - radius):min(overlay.shape[0], cy + radius),
+        max(0, cx - radius):min(overlay.shape[1], cx + radius)
+    ]
+
+    for c in range(3):
+        channel = (inner_color[c] * (1 - t) + outer_color[c] * t).astype(np.uint8)
+        region[:, :, c] = np.where(mask, np.maximum(region[:, :, c], channel), region[:, :, c])
+
+
+def draw_label_with_marker(overlay, x, y, text, color, alpha, marker_r, frame_count):
+    """Draw a data-viz style label: small circle + crosshair + text, like the reference."""
+    flicker = 0.7 + 0.3 * math.sin(frame_count * 0.15 + hash(text) % 100)
+    a = max(0.0, min(1.0, alpha * flicker))
+    c = tuple(int(v * a) for v in color)
+    ix, iy = int(x), int(y)
+
+    # Circle marker
+    cv2.circle(overlay, (ix, iy), marker_r, c, 1, cv2.LINE_AA)
+    # Small crosshair inside
+    cr = max(1, marker_r - 1)
+    cv2.line(overlay, (ix - cr, iy), (ix + cr, iy), c, 1, cv2.LINE_AA)
+    cv2.line(overlay, (ix, iy - cr), (ix, iy + cr), c, 1, cv2.LINE_AA)
+
+    # Text offset to the right
+    cv2.putText(overlay, text, (ix + marker_r + 4, iy + 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, c, 1, cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Gesture detection
+# ---------------------------------------------------------------------------
+
+def finger_extended(landmarks, tip_id, pip_id, is_thumb=False, wrist=None):
+    tip = landmarks[tip_id]
+    pip_joint = landmarks[pip_id]
+    if is_thumb and wrist is not None:
+        return abs(tip[0] - wrist[0]) > abs(pip_joint[0] - wrist[0]) + 10
+    return tip[1] < pip_joint[1] - 20
+
+
+def detect_gesture(landmarks, handedness):
+    wrist = landmarks[0]
+    thumb_ext = finger_extended(landmarks, 4, 3, is_thumb=True, wrist=wrist)
+    index_ext = finger_extended(landmarks, 8, 6)
+    middle_ext = finger_extended(landmarks, 12, 10)
+    ring_ext = finger_extended(landmarks, 16, 14)
+    pinky_ext = finger_extended(landmarks, 20, 18)
+
+    all_extended = thumb_ext and index_ext and middle_ext and ring_ext and pinky_ext
+
+    if all_extended:
+        thumb_tip = np.array(landmarks[4], dtype=np.float64)
+        pinky_tip = np.array(landmarks[20], dtype=np.float64)
+        wrist_pt = np.array(landmarks[0], dtype=np.float64)
+        middle_base = np.array(landmarks[9], dtype=np.float64)
+        hand_size = np.linalg.norm(wrist_pt - middle_base) + 1e-6
+        spread = np.linalg.norm(thumb_tip - pinky_tip)
+        if spread / hand_size > 0.4:
+            return "EXPLOSION"
+
+    if handedness == "Right":
+        if index_ext and pinky_ext and not middle_ext and not ring_ext:
+            return "CONSTELLATION"
+    if handedness == "Left":
+        if index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            return "RED_MOON"
+
+    return "NONE"
+
+
+# ---------------------------------------------------------------------------
+# Effect state
+# ---------------------------------------------------------------------------
+
+class EffectState:
+    def __init__(self):
+        self.particles = []
+        self.labels = []
+        self.bolts = []
+        self.rings = []  # large elliptical rings for explosion/constellation
+        self.explosion_flash = 0
+        self.explosion_cooldown = 0
+        self.moon_pulse_phase = 0.0
+        self.frame_count = 0
+
+    def reset(self):
+        self.particles.clear()
+        self.labels.clear()
+        self.bolts.clear()
+        self.rings.clear()
+        self.explosion_flash = 0
+        self.explosion_cooldown = 0
+
+    def update(self):
+        self.frame_count += 1
+        self.moon_pulse_phase += 0.052  # ~1 Hz at 60fps
+
+        alive = []
+        for p in self.particles:
+            p["x"] += p["vx"]
+            p["y"] += p["vy"]
+            p["vy"] += p["gravity"]
+            p["age"] += 1
+            if p["age"] < p["max_age"]:
+                alive.append(p)
+        self.particles = alive
+
+        alive_labels = []
+        for lb in self.labels:
+            lb["x"] += lb["vx"]
+            lb["y"] += lb["vy"]
+            lb["age"] += 1
+            if lb["age"] < lb["max_age"]:
+                alive_labels.append(lb)
+        self.labels = alive_labels
+
+        alive_bolts = []
+        for b in self.bolts:
+            b["age"] += 1
+            if b["age"] < b["max_age"]:
+                alive_bolts.append(b)
+        self.bolts = alive_bolts
+
+        alive_rings = []
+        for r in self.rings:
+            r["age"] += 1
+            if r["age"] < r["max_age"]:
+                alive_rings.append(r)
+        self.rings = alive_rings
+
+        if self.explosion_cooldown > 0:
+            self.explosion_cooldown -= 1
+            if self.explosion_cooldown <= 0:
+                self.reset()
+
+        if self.explosion_flash > 0:
+            self.explosion_flash -= 1
+
+    def render_particles(self, overlay):
+        for p in self.particles:
+            alpha = 1.0
+            if p["fade"]:
+                alpha = max(0.0, 1.0 - p["age"] / p["max_age"])
+            c = tuple(int(v * alpha) for v in p["color"])
+            sz = max(1, int(p["size"] * (0.3 + 0.7 * alpha)))
+            pos = (int(p["x"]), int(p["y"]))
+            cv2.circle(overlay, pos, sz, c, -1, cv2.LINE_AA)
+
+    def render_labels(self, overlay):
+        for lb in self.labels:
+            alpha = max(0.0, 1.0 - lb["age"] / lb["max_age"])
+            draw_label_with_marker(
+                overlay, lb["x"], lb["y"], lb["text"],
+                lb["color"], alpha, lb["marker_radius"], self.frame_count
+            )
+
+    def render_bolts(self, overlay):
+        for b in self.bolts:
+            alpha = max(0.0, 1.0 - b["age"] / b["max_age"])
+            thickness = b.get("thickness", 2)
+            # Outer purple glow
+            c_outer = (int(180 * alpha), int(50 * alpha), int(255 * alpha))
+            # Inner bright white
+            c_inner = (int(255 * alpha), int(230 * alpha), int(255 * alpha))
+            pts = np.array(b["points"], dtype=np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(overlay, [pts], False, c_outer,
+                              thickness + 4, cv2.LINE_AA)
+                cv2.polylines(overlay, [pts], False, c_inner,
+                              thickness, cv2.LINE_AA)
+
+    def render_rings(self, overlay):
+        for r in self.rings:
+            alpha = max(0.0, 1.0 - r["age"] / r["max_age"])
+            c = tuple(int(v * alpha) for v in r["color"])
+            grow = 1.0 + r["age"] * r.get("grow_rate", 0.0)
+            axes = (int(r["rx"] * grow), int(r["ry"] * grow))
+            if axes[0] > 0 and axes[1] > 0:
+                cv2.ellipse(overlay, (int(r["cx"]), int(r["cy"])), axes,
+                            r.get("angle", 0), 0, 360, c,
+                            r.get("thickness", 1), cv2.LINE_AA)
+
+
+# ---------------------------------------------------------------------------
+# Gesture effects
+# ---------------------------------------------------------------------------
+
+def spawn_constellation(state, cx, cy, w, h):
+    """Dense constellation particle field spread across a wide area."""
+    # Maintain ~200 particles
+    count = sum(1 for p in state.particles if p.get("_tag") == "constellation")
+    need = 200 - count
+    for _ in range(max(0, min(need, 15))):  # spawn up to 15/frame to avoid lag
+        angle = random.uniform(0, 2 * math.pi)
+        # Wide elliptical spread — fills much of the screen around hand
+        rx = random.gauss(0, 130)
+        ry = random.gauss(0, 70)
+        px = cx + rx * math.cos(angle) - ry * math.sin(angle)
+        py = cy + rx * math.sin(angle) + ry * math.cos(angle)
+        vx = random.uniform(-0.2, 0.2)
+        vy = random.uniform(-0.2, 0.2)
+        # Blue-white tint
+        b = random.randint(210, 255)
+        g = random.randint(200, 245)
+        r = random.randint(180, 230)
+        sz = random.choices([1, 2, 3, 4], weights=[4, 3, 2, 1])[0]
+        p = make_particle(px, py, vx, vy, color=(b, g, r),
+                          size=sz, max_age=random.randint(60, 120), fade=True)
+        p["_tag"] = "constellation"
+        state.particles.append(p)
+
+    # Maintain ~25 labels spread wide
+    lbl_count = sum(1 for lb in state.labels if lb.get("_tag") == "constellation")
+    need_lb = 25 - lbl_count
+    for _ in range(max(0, min(need_lb, 5))):
+        angle = random.uniform(0, 2 * math.pi)
+        r = random.uniform(60, 200)
+        lx = cx + r * math.cos(angle)
+        ly = cy + r * math.sin(angle)
+        # Keep labels on screen
+        lx = max(30, min(w - 80, lx))
+        ly = max(20, min(h - 20, ly))
+        lb = make_label(lx, ly, vx=random.uniform(-0.1, 0.1),
+                        vy=random.uniform(-0.1, 0.1),
+                        max_age=random.randint(100, 200),
+                        color=(255, 245, 230))
+        lb["_tag"] = "constellation"
+        state.labels.append(lb)
+
+
+def render_constellation_ring(overlay, cx, cy):
+    """Large faint elliptical ring like in reference."""
+    cv2.ellipse(overlay, (int(cx), int(cy)), (160, 80), 15, 0, 360,
+                (120, 120, 120), 1, cv2.LINE_AA)
+    # Second slightly tilted ring
+    cv2.ellipse(overlay, (int(cx), int(cy)), (140, 60), -10, 0, 360,
+                (90, 90, 90), 1, cv2.LINE_AA)
+
+
+def render_red_moon(state, fx, fy, overlay):
+    """Render the red moon — solid sphere with radial gradient + craters."""
+    base_r = 50
+    pulse = int(5 * math.sin(state.moon_pulse_phase))
+    radius = base_r + pulse
+    cx, cy = int(fx), int(fy)
+
+    # Radial gradient: bright orange-white center → deep red edge
+    draw_radial_gradient_sphere(
+        overlay, cx, cy, radius,
+        inner_color=(140, 220, 255),   # BGR: warm white-orange center
+        outer_color=(10, 30, 180),     # BGR: deep red edge
+    )
+
+    # Surface craters (deterministic so they don't flicker)
+    rng = np.random.RandomState(42)
+    for _ in range(20):
+        angle = rng.uniform(0, 2 * math.pi)
+        dist = rng.uniform(0, radius * 0.75)
+        px = int(cx + dist * math.cos(angle))
+        py = int(cy + dist * math.sin(angle))
+        pr = rng.randint(2, 7)
+        cv2.circle(overlay, (px, py), pr, (5, 15, 80), -1)
+        # Crater rim highlight
+        cv2.circle(overlay, (px - 1, py - 1), pr, (30, 60, 140), 1)
+
+    # Bright specular highlight (top-left)
+    highlight_x = cx - int(radius * 0.25)
+    highlight_y = cy - int(radius * 0.25)
+    cv2.circle(overlay, (highlight_x, highlight_y), int(radius * 0.18),
+               (120, 190, 255), -1)
+
+    # Outer glow halo
+    for i in range(3):
+        r = radius + 8 + i * 12
+        alpha = max(0, 80 - i * 25)
+        cv2.circle(overlay, (cx, cy), r, (10, int(alpha * 0.4), alpha), 2, cv2.LINE_AA)
+
+
+def spawn_purple_merge(state, mx, my, overlay, w, h):
+    """Intense purple merge sphere with bright core, arcs, particles."""
+    radius = 70
+    cx, cy = int(mx), int(my)
+
+    # Sphere: deep violet outer, bright magenta-white core
+    draw_radial_gradient_sphere(
+        overlay, cx, cy, radius,
+        inner_color=(255, 230, 255),   # BGR: bright magenta-white core
+        outer_color=(160, 20, 120),    # BGR: deep violet edge
+    )
+
+    # Extremely bright white core
+    cv2.circle(overlay, (cx, cy), int(radius * 0.3), (255, 255, 255), -1)
+    cv2.circle(overlay, (cx, cy), int(radius * 0.15), (255, 255, 255), -1)
+
+    # Radial light rays (like in reference — bright streaks emanating outward)
+    num_rays = 16
+    for i in range(num_rays):
+        angle = (i / num_rays) * 2 * math.pi + state.frame_count * 0.02
+        jitter = random.uniform(-0.08, 0.08)
+        ray_len = random.uniform(80, 200)
+        ex = cx + ray_len * math.cos(angle + jitter)
+        ey = cy + ray_len * math.sin(angle + jitter)
+        alpha_ray = random.uniform(0.3, 0.8)
+        c_ray = (int(200 * alpha_ray), int(120 * alpha_ray), int(255 * alpha_ray))
+        cv2.line(overlay, (cx, cy), (int(ex), int(ey)), c_ray, 1, cv2.LINE_AA)
+
+    # Purple-tinted particle cloud
+    count = sum(1 for p in state.particles if p.get("_tag") == "merge")
+    need = 120 - count
+    for _ in range(max(0, min(need, 10))):
+        angle = random.uniform(0, 2 * math.pi)
+        rx = random.gauss(0, 80)
+        ry = random.gauss(0, 45)
+        px = mx + rx * math.cos(angle) - ry * math.sin(angle)
+        py = my + rx * math.sin(angle) + ry * math.cos(angle)
+        vx = random.uniform(-0.4, 0.4)
+        vy = random.uniform(-0.4, 0.4)
+        b = random.randint(180, 255)
+        g = random.randint(80, 160)
+        r_val = random.randint(180, 255)
+        p = make_particle(px, py, vx, vy, color=(b, g, r_val),
+                          size=random.randint(1, 3), max_age=80, fade=True)
+        p["_tag"] = "merge"
+        state.particles.append(p)
+
+    # Electric arcs — flickering bolts
+    if state.frame_count % random.choice([2, 3]) == 0:
+        state.bolts = [b for b in state.bolts if b.get("_tag") != "merge"]
+        for _ in range(random.randint(4, 7)):
+            angle = random.uniform(0, 2 * math.pi)
+            length = random.uniform(100, 220)
+            ex = mx + length * math.cos(angle)
+            ey = my + length * math.sin(angle)
+            bolt = make_bolt(int(mx), int(my), int(ex), int(ey),
+                             segments=random.randint(6, 10), max_age=5,
+                             thickness=random.choice([1, 2]))
+            bolt["_tag"] = "merge"
+            state.bolts.append(bolt)
+
+    # Floating labels
+    lbl_count = sum(1 for lb in state.labels if lb.get("_tag") == "merge")
+    need_lb = 12 - lbl_count
+    for _ in range(max(0, min(need_lb, 3))):
+        angle = random.uniform(0, 2 * math.pi)
+        r = random.uniform(70, 160)
+        lx = mx + r * math.cos(angle)
+        ly = my + r * math.sin(angle)
+        lb = make_label(lx, ly, vx=random.uniform(-0.15, 0.15),
+                        vy=random.uniform(-0.15, 0.15),
+                        max_age=random.randint(90, 150),
+                        color=(240, 200, 255))
+        lb["_tag"] = "merge"
+        state.labels.append(lb)
+
+
+def trigger_explosion(state, cx, cy, w, h):
+    """Massive full-screen explosion matching the reference intensity."""
+    state.explosion_flash = 3
+    state.explosion_cooldown = 180  # ~3 seconds
+
+    # 400 particles outward — dense field
+    for _ in range(400):
+        angle = random.uniform(0, 2 * math.pi)
+        speed = random.uniform(2, 25)
+        vx = speed * math.cos(angle)
+        vy = speed * math.sin(angle)
+        # Mix of white, purple, magenta
+        palette = random.choice([
+            (255, 255, 255),    # white
+            (255, 200, 255),    # light purple
+            (200, 120, 255),    # purple
+            (180, 80, 230),     # deep purple
+            (220, 180, 255),    # magenta-white
+        ])
+        sz = random.choices([1, 2, 3, 4, 5], weights=[2, 3, 3, 2, 1])[0]
+        p = make_particle(cx, cy, vx, vy, color=palette,
+                          size=sz, max_age=random.randint(35, 60), fade=True,
+                          gravity=0.05)
+        p["_tag"] = "explosion"
+        state.particles.append(p)
+
+    # 15 lightning bolts to screen edges — thick and bright
+    for _ in range(15):
+        edge = random.choice(["top", "bottom", "left", "right"])
+        if edge == "top":
+            ex, ey = random.randint(0, w), 0
+        elif edge == "bottom":
+            ex, ey = random.randint(0, w), h
+        elif edge == "left":
+            ex, ey = 0, random.randint(0, h)
+        else:
+            ex, ey = w, random.randint(0, h)
+        bolt = make_bolt(cx, cy, ex, ey,
+                         segments=random.randint(8, 14), max_age=25,
+                         thickness=random.choice([2, 3]))
+        bolt["_tag"] = "explosion"
+        state.bolts.append(bolt)
+
+    # 60 drifting text labels scattered across entire screen
+    for _ in range(60):
+        lx = random.randint(30, w - 80)
+        ly = random.randint(30, h - 30)
+        lb = make_label(lx, ly, vx=random.uniform(-0.4, 0.4),
+                        vy=random.uniform(-0.4, 0.4),
+                        max_age=random.randint(70, 110),
+                        color=(240, 210, 255))
+        lb["_tag"] = "explosion"
+        state.labels.append(lb)
+
+    # Large expanding rings from center (like the reference's circular shockwave)
+    for i in range(3):
+        state.rings.append({
+            "cx": cx, "cy": cy,
+            "rx": 40 + i * 30, "ry": 30 + i * 20,
+            "angle": random.uniform(-20, 20),
+            "color": (180, 140, 220),
+            "thickness": 2,
+            "age": 0, "max_age": 60,
+            "grow_rate": 0.06 + i * 0.02,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Landmark smoothing
+# ---------------------------------------------------------------------------
+
+class LandmarkSmoother:
+    def __init__(self, buffer_size=5):
+        self.buffer_size = buffer_size
+        self.buffers = {
+            "Left": deque(maxlen=buffer_size),
+            "Right": deque(maxlen=buffer_size),
+        }
+
+    def smooth(self, handedness, landmarks):
+        self.buffers[handedness].append(landmarks)
+        buf = self.buffers[handedness]
+        n = len(buf)
+        smoothed = []
+        for i in range(21):
+            sx = sum(b[i][0] for b in buf) / n
+            sy = sum(b[i][1] for b in buf) / n
+            smoothed.append((sx, sy))
+        return smoothed
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main():
+    # --- MediaPipe Tasks API (v0.10+) ---
+    import os
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "hand_landmarker.task")
+    if not os.path.exists(model_path):
+        print(f"ERROR: Model file not found at {model_path}")
+        print("Download it with:")
+        print("  curl -sL -o hand_landmarker.task "
+              "https://storage.googleapis.com/mediapipe-models/"
+              "hand_landmarker/hand_landmarker/float16/latest/"
+              "hand_landmarker.task")
+        return
+
+    BaseOptions = mp.tasks.BaseOptions
+    HandLandmarker = mp.tasks.vision.HandLandmarker
+    HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+    VisionRunningMode = mp.tasks.vision.RunningMode
+
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.75,
+        min_hand_presence_confidence=0.75,
+        min_tracking_confidence=0.6,
+    )
+    landmarker = HandLandmarker.create_from_options(options)
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("ERROR: Cannot open webcam (index 0).")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    # Warm up the camera — macOS needs a moment before frames are available
+    print("Warming up camera...")
+    for _ in range(30):
+        cap.read()
+        time.sleep(0.03)
+
+    # Read one frame to get dimensions before creating window
+    ret, test_frame = cap.read()
+    if not ret:
+        print("ERROR: Camera opened but no frames received.")
+        cap.release()
+        return
+    print(f"Camera ready: {test_frame.shape[1]}x{test_frame.shape[0]}")
+
+    cv2.namedWindow("AR Gestures", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("AR Gestures", cv2.WND_PROP_FULLSCREEN,
+                          cv2.WINDOW_FULLSCREEN)
+
+    state = EffectState()
+    smoother = LandmarkSmoother(buffer_size=5)
+    fps_timer = time.time()
+    fps_value = 0.0
+    frame_count_fps = 0
+    timestamp_ms = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            # Camera may drop frames occasionally — skip instead of exit
+            continue
+
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
+
+        # Convert to MediaPipe Image and detect
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms += 33  # ~30fps timestamps (monotonically increasing)
+        results = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        # Collect per-hand data
+        hand_data = {}
+        gesture_map = {}
+
+        if results.hand_landmarks and results.handedness:
+            for hand_landmarks, hand_info in zip(
+                    results.hand_landmarks, results.handedness):
+                label = hand_info[0].category_name  # 'Left' or 'Right'
+                conf = hand_info[0].score
+                if conf < 0.75:
+                    continue
+                # Landmarks are normalized [0,1] — convert to pixel coords
+                raw = [(int(lm.x * w), int(lm.y * h))
+                       for lm in hand_landmarks]
+                smoothed = smoother.smooth(label, raw)
+                hand_data[label] = smoothed
+                gesture_map[label] = detect_gesture(smoothed, label)
+
+        # Determine active gesture(s)
+        active_gesture = "IDLE"
+
+        if state.explosion_cooldown > 0:
+            active_gesture = "EXPLOSION"
+        else:
+            # Purple Merge check (both hands, index tips close)
+            if "Right" in hand_data and "Left" in hand_data:
+                r_idx = hand_data["Right"][8]
+                l_idx = hand_data["Left"][8]
+                dist = math.sqrt((r_idx[0] - l_idx[0]) ** 2 +
+                                 (r_idx[1] - l_idx[1]) ** 2)
+                if dist < 150:
+                    active_gesture = "PURPLE_MERGE"
+
+            # Explosion check
+            if active_gesture == "IDLE":
+                for label, gest in gesture_map.items():
+                    if gest == "EXPLOSION":
+                        active_gesture = "EXPLOSION_TRIGGER"
+                        palm_center = hand_data[label][9]
+                        trigger_explosion(state, int(palm_center[0]),
+                                          int(palm_center[1]), w, h)
+                        break
+
+            # Individual gestures (can co-exist)
+            if active_gesture == "IDLE":
+                right_g = gesture_map.get("Right", "NONE")
+                left_g = gesture_map.get("Left", "NONE")
+                if right_g == "CONSTELLATION" and left_g == "RED_MOON":
+                    active_gesture = "CONSTELLATION+RED_MOON"
+                elif right_g == "CONSTELLATION":
+                    active_gesture = "CONSTELLATION"
+                elif left_g == "RED_MOON":
+                    active_gesture = "RED_MOON"
+
+        # Overlay for all effects (drawn on black, then bloom + additive blend)
+        overlay = np.zeros((h, w, 3), dtype=np.uint8)
+
+        # Clean stale particles when gesture changes
+        if state.explosion_cooldown <= 0:
+            allowed_tags = {"explosion"}
+            if "CONSTELLATION" in active_gesture:
+                allowed_tags.add("constellation")
+            if "RED_MOON" in active_gesture:
+                allowed_tags.add("red_moon")
+            if active_gesture == "PURPLE_MERGE":
+                allowed_tags.add("merge")
+            state.particles = [p for p in state.particles
+                               if p.get("_tag") in allowed_tags]
+            state.labels = [lb for lb in state.labels
+                            if lb.get("_tag") in allowed_tags]
+            state.bolts = [b for b in state.bolts
+                           if b.get("_tag") in allowed_tags]
+
+        # --- Render gestures ---
+
+        if "CONSTELLATION" in active_gesture and "Right" in hand_data:
+            mid_base = hand_data["Right"][9]
+            cx_c = int(mid_base[0])
+            cy_c = int(mid_base[1]) - 100
+            spawn_constellation(state, cx_c, cy_c, w, h)
+            render_constellation_ring(overlay, cx_c, cy_c)
+
+        if "RED_MOON" in active_gesture and "Left" in hand_data:
+            idx_tip = hand_data["Left"][8]
+            fx = int(idx_tip[0])
+            fy = int(idx_tip[1]) - 70
+            render_red_moon(state, fx, fy, overlay)
+
+        if active_gesture == "PURPLE_MERGE" and "Right" in hand_data and "Left" in hand_data:
+            r_idx = hand_data["Right"][8]
+            l_idx = hand_data["Left"][8]
+            mx = int((r_idx[0] + l_idx[0]) / 2)
+            my = int((r_idx[1] + l_idx[1]) / 2)
+            spawn_purple_merge(state, mx, my, overlay, w, h)
+
+        # Explosion flash
+        if state.explosion_flash > 0:
+            flash_intensity = state.explosion_flash / 3.0
+            flash = np.full_like(overlay, 0)
+            flash[:] = (
+                int(220 * flash_intensity),
+                int(180 * flash_intensity),
+                int(255 * flash_intensity),
+            )
+            overlay = cv2.add(overlay, flash)
+
+        # Render all persistent objects onto overlay
+        state.render_rings(overlay)
+        state.render_particles(overlay)
+        state.render_labels(overlay)
+        state.render_bolts(overlay)
+
+        # Multi-layer bloom
+        glow = multi_layer_glow(overlay)
+
+        # Additive blend onto camera frame
+        output = cv2.add(frame, glow)
+
+        # --- HUD (bottom-left, semi-transparent) ---
+        frame_count_fps += 1
+        now = time.time()
+        if now - fps_timer >= 0.5:
+            fps_value = frame_count_fps / (now - fps_timer)
+            frame_count_fps = 0
+            fps_timer = now
+
+        hand_count = len(hand_data)
+        hud_gesture = active_gesture if active_gesture != "IDLE" else "None"
+        hud_lines = [
+            f"Gesture: {hud_gesture}",
+            f"FPS: {fps_value:.0f}",
+            f"Hands: {hand_count}",
+        ]
+        hud_x, hud_y = 10, h - 75
+        hud_bg = output.copy()
+        cv2.rectangle(hud_bg, (hud_x - 5, hud_y - 18),
+                      (hud_x + 260, hud_y + 52), (0, 0, 0), -1)
+        output = cv2.addWeighted(hud_bg, 0.45, output, 0.55, 0)
+
+        for i, line in enumerate(hud_lines):
+            cv2.putText(output, line, (hud_x, hud_y + i * 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 255), 1,
+                        cv2.LINE_AA)
+
+        state.update()
+
+        cv2.imshow("AR Gestures", output)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    landmarker.close()
+
+
+if __name__ == "__main__":
+    main()
 
